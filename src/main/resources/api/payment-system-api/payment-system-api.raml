@@ -1,0 +1,51 @@
+#%RAML 1.0
+title: Payment System API
+version: v1.0.0
+description: Interfaces with bank gateways to capture card payments and handle reversals.
+mediaType: [application/json]
+protocols: [HTTP, HTTPS]
+
+traits:
+  stepTraceable: !include traits/headers.raml
+
+types:
+  ChargeRequest: !include types/payment-charge-req.raml
+  ChargeResponse: !include types/payment-charge-res.raml
+  RefundRequest: !include types/payment-refund-req.raml
+  RefundResponse: !include types/payment-refund-res.raml
+
+/payments:
+  /charge:
+    post:
+      displayName: Execute Charge
+      is: [stepTraceable]
+      body:
+        application/json:
+          type: ChargeRequest
+      responses:
+        200:
+          body:
+            application/json:
+              type: ChargeResponse
+              example:
+                paymentId: "PAY-2026-98124"
+                orderId: "ORD-2026-1001"
+                status: "CHARGED"
+                gatewayRef: "GTW-TXN-40012"
+
+  /refund:
+    post:
+      displayName: Compensate - Refund Payment
+      is: [stepTraceable]
+      body:
+        application/json:
+          type: RefundRequest
+      responses:
+        200:
+          body:
+            application/json:
+              type: RefundResponse
+              example:
+                refundId: "REF-2026-30219"
+                paymentId: "PAY-2026-98124"
+                status: "REFUNDED"

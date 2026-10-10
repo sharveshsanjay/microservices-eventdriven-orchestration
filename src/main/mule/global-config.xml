@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd">
+
+    <!-- Application Properties -->
+    <configuration-properties doc:name="Configuration properties" file="application.yaml" />
+
+    <!-- Shared HTTP Inbound Listener -->
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="${http.host}" port="${http.port}" />
+    </http:listener-config>
+
+    <!-- Shared HTTP Requestor -->
+    <http:request-config name="HTTP_Request_configuration" doc:name="HTTP Request configuration" responseTimeout="${http.timeout}">
+        <http:request-connection host="${http.host}" port="${http.port}" />
+    </http:request-config>
+
+    <!-- CloudAMQP / LavinMQ Broker Configuration -->
+    <amqp:config name="RabbitMQ_Config" doc:name="AMQP Config">
+        <amqp:connection host="${rabbitmq.host}" 
+                         port="${rabbitmq.port}" 
+                         virtualHost="${rabbitmq.virtualHost}" 
+                         username="${rabbitmq.username}" 
+                         password="${rabbitmq.password}" />
+    </amqp:config>
+
+    <!-- 1. SAGA ORCHESTRATOR DB CONFIG (saga_db) -->
+    <db:config name="Saga_DB_Config" doc:name="Saga DB Config">
+        <db:my-sql-connection host="${db.host}" 
+                              port="${db.port}" 
+                              user="${db.user}" 
+                              password="${db.password}" 
+                              database="${db.saga.database}">
+            <db:pooling-profile maxPoolSize="${db.pool.maxSize}" 
+                                minPoolSize="${db.pool.minSize}" 
+                                acquireIncrement="1" 
+                                preparedStatementCacheSize="30" 
+                                maxWait="${db.pool.connectionTimeoutMs}" />
+            <db:connection-properties>
+                <db:connection-property key="sslMode" value="REQUIRED" />
+                <db:connection-property key="trustCertificateKeyStoreUrl" value="classpath:${db.truststore.path}" />
+                <db:connection-property key="trustCertificateKeyStorePassword" value="${db.truststore.password}" />
+                <db:connection-property key="trustCertificateKeyStoreType" value="PKCS12" />
+                <db:connection-property key="allowMultiQueries" value="true" />
+                <db:connection-property key="useUnicode" value="true" />
+                <db:connection-property key="characterEncoding" value="UTF-8" />
+                <db:connection-property key="serverTimezone" value="UTC" />
+            </db:connection-properties>
+        </db:my-sql-connection>
+    </db:config>
+
+    <!-- 2. INVENTORY MICROSERVICE DB CONFIG (inventory_db) -->
+    <db:config name="Inventory_DB_Config" doc:name="Inventory DB Config">
+        <db:my-sql-connection host="${db.host}" 
+                              port="${db.port}" 
+                              user="${db.user}" 
+                              password="${db.password}" 
+                              database="${db.inventory.database}">
+            <db:pooling-profile maxPoolSize="${db.pool.maxSize}" 
+                                minPoolSize="${db.pool.minSize}" 
+                                acquireIncrement="1" 
+                                preparedStatementCacheSize="30" 
+                                maxWait="${db.pool.connectionTimeoutMs}" />
+            <db:connection-properties>
+                <db:connection-property key="sslMode" value="REQUIRED" />
+                <db:connection-property key="trustCertificateKeyStoreUrl" value="classpath:${db.truststore.path}" />
+                <db:connection-property key="trustCertificateKeyStorePassword" value="${db.truststore.password}" />
+                <db:connection-property key="trustCertificateKeyStoreType" value="PKCS12" />
+                <db:connection-property key="useUnicode" value="true" />
+                <db:connection-property key="characterEncoding" value="UTF-8" />
+                <db:connection-property key="serverTimezone" value="UTC" />
+            </db:connection-properties>
+        </db:my-sql-connection>
+    </db:config>
+
+    <!-- 3. PAYMENT MICROSERVICE DB CONFIG (payment_db) -->
+    <db:config name="Payment_DB_Config" doc:name="Payment DB Config">
+        <db:my-sql-connection host="${db.host}" 
+                              port="${db.port}" 
+                              user="${db.user}" 
+                              password="${db.password}" 
+                              database="${db.payment.database}">
+            <db:pooling-profile maxPoolSize="${db.pool.maxSize}" 
+                                minPoolSize="${db.pool.minSize}" 
+                                acquireIncrement="1" 
+                                preparedStatementCacheSize="30" 
+                                maxWait="${db.pool.connectionTimeoutMs}" />
+            <db:connection-properties>
+                <db:connection-property key="sslMode" value="REQUIRED" />
+                <db:connection-property key="trustCertificateKeyStoreUrl" value="classpath:${db.truststore.path}" />
+                <db:connection-property key="trustCertificateKeyStorePassword" value="${db.truststore.password}" />
+                <db:connection-property key="trustCertificateKeyStoreType" value="PKCS12" />
+                <db:connection-property key="useUnicode" value="true" />
+                <db:connection-property key="characterEncoding" value="UTF-8" />
+                <db:connection-property key="serverTimezone" value="UTC" />
+            </db:connection-properties>
+        </db:my-sql-connection>
+    </db:config>
+
+    <!-- 4. SHIPPING MICROSERVICE DB CONFIG (shipping_db) -->
+    <db:config name="Shipping_DB_Config" doc:name="Shipping DB Config">
+        <db:my-sql-connection host="${db.host}" 
+                              port="${db.port}" 
+                              user="${db.user}" 
+                              password="${db.password}" 
+                              database="${db.shipping.database}">
+            <db:pooling-profile maxPoolSize="${db.pool.maxSize}" 
+                                minPoolSize="${db.pool.minSize}" 
+                                acquireIncrement="1" 
+                                preparedStatementCacheSize="30" 
+                                maxWait="${db.pool.connectionTimeoutMs}" />
+            <db:connection-properties>
+                <db:connection-property key="sslMode" value="REQUIRED" />
+                <db:connection-property key="trustCertificateKeyStoreUrl" value="classpath:${db.truststore.path}" />
+                <db:connection-property key="trustCertificateKeyStorePassword" value="${db.truststore.password}" />
+                <db:connection-property key="trustCertificateKeyStoreType" value="PKCS12" />
+                <db:connection-property key="useUnicode" value="true" />
+                <db:connection-property key="characterEncoding" value="UTF-8" />
+                <db:connection-property key="serverTimezone" value="UTC" />
+            </db:connection-properties>
+        </db:my-sql-connection>
+    </db:config>
+
+</mule>

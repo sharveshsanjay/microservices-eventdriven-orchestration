@@ -1,0 +1,50 @@
+#%RAML 1.0
+title: Inventory System API
+version: v1.0.0
+description: Manages warehouse stock allocations, holds, and rollbacks.
+mediaType: [application/json]
+protocols: [HTTP, HTTPS]
+
+traits:
+  stepTraceable: !include traits/headers.raml
+
+types:
+  ReserveRequest: !include types/inventory-reserve-req.raml
+  ReserveResponse: !include types/inventory-reserve-res.raml
+  ReleaseRequest: !include types/inventory-release-req.raml
+
+/inventory:
+  /reservations:
+    post:
+      displayName: Reserve Warehouse Stock
+      is: [stepTraceable]
+      body:
+        application/json:
+          type: ReserveRequest
+      responses:
+        201:
+          body:
+            application/json:
+              type: ReserveResponse
+              example:
+                reservationId: "RSV-2026-558102"
+                status: "RESERVED"
+                expiresAt: "2026-09-11T17:32:10+05:30"
+
+    /release:
+      post:
+        displayName: Compensate - Release Stock Hold
+        is: [stepTraceable]
+        body:
+          application/json:
+            type: ReleaseRequest
+            example:
+              reservationId: "RSV-2026-558102"
+              reason: "SAGA_COMPENSATION"
+        responses:
+          200:
+            body:
+              application/json:
+                example:
+                  reservationId: "RSV-2026-558102"
+                  status: "RELEASED"

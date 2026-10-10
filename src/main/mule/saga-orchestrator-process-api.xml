@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/amqp http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <apikit:config name="saga-orchestrator-process-api-config" 
+                   api="saga-orchestrator-process-api/saga-orchestrator-process-api.raml" 
+                   outboundHeadersMapName="outboundHeaders" 
+                   httpStatusVarName="httpStatus" />
+
+    <flow name="saga-orchestrator-process-api-main">
+        <http:listener config-ref="HTTP_Listener_config" path="/api/v1/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[vars.outboundHeaders default {} ++ {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': '*'
+                }]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body>#[payload]</http:body>
+                <http:headers>#[vars.outboundHeaders default {} ++ {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': '*'
+                }]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <!-- Intercept CORS Preflight before APIKit -->
+        <choice doc:name="Check for Preflight OPTIONS">
+            <when expression="#[attributes.method == 'OPTIONS']">
+                <set-variable variableName="httpStatus" value="200" doc:name="Set 200 OK"/>
+                <set-payload value="#['']" doc:name="Empty Payload"/>
+            </when>
+            <otherwise>
+                <apikit:router config-ref="saga-orchestrator-process-api-config" />
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- POST /sagas/order-fulfilment (Saga Initiation) -->
+    <flow name="post:\sagas\order-fulfilment:application\json:saga-orchestrator-process-api-config">
+        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
+        <set-variable variableName="rawPayload" value="#[payload]"/>
+        <set-variable variableName="orderId" value="#[payload.orderId]"/>
+
+        <db:select config-ref="Saga_DB_Config" target="existingSaga" doc:name="Check Existing Saga">
+            <db:sql><![CDATA[SELECT saga_id, saga_state FROM saga_instances WHERE order_id = :orderId AND saga_type = :sagaType]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                'orderId': vars.orderId,
+                'sagaType': p('saga.type')
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <choice>
+            <when expression="#[!isEmpty(vars.existingSaga)]">
+                <ee:transform doc:name="Return Existing Status">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+                        output application/json
+                        ---
+                        {
+                            sagaId: vars.existingSaga[0].saga_id,
+                            orderId: vars.orderId,
+                            sagaState: vars.existingSaga[0].saga_state,
+                            statusUrl: p('http.basePath') ++ "/sagas/" ++ vars.existingSaga[0].saga_id,
+                            correlationId: vars.correlationId
+                        }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="200"/>
+            </when>
+
+            <otherwise>
+                <set-variable variableName="sagaId" value="#['SAGA-' ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 6])]"/>
+
+                <try doc:name="Atomic Try Scope" transactionalAction="ALWAYS_BEGIN">
+                    <db:insert config-ref="Saga_DB_Config" doc:name="Insert saga_instance">
+                        <db:sql><![CDATA[
+                            INSERT INTO saga_instances (
+                                saga_id, saga_type, order_id, customer_id, request_payload, 
+                                saga_state, current_step, state_version, correlation_id, started_at
+                            ) VALUES (
+                                :sagaId, :sagaType, :orderId, :custId, :reqPayload, 
+                                'STEP_IN_PROGRESS', 1, 1, :corrId, CURRENT_TIMESTAMP
+                            )
+                        ]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                            'sagaId': vars.sagaId,
+                            'sagaType': p('saga.type'),
+                            'orderId': vars.orderId,
+                            'custId': vars.rawPayload.customerId,
+                            'reqPayload': write(vars.rawPayload, 'application/json'),
+                            'corrId': vars.correlationId
+                        }]]]></db:input-parameters>
+                    </db:insert>
+
+                    <db:insert config-ref="Saga_DB_Config" doc:name="Insert saga_steps">
+                        <db:sql><![CDATA[
+                            INSERT INTO saga_steps (step_id, saga_id, step_sequence, step_name, step_state, compensation_state)
+                            VALUES (:s1, :sagaId, 1, 'RESERVE_INVENTORY', 'IN_PROGRESS', 'NOT_REQUIRED'),
+                                   (:s2, :sagaId, 2, 'CHARGE_PAYMENT', 'NOT_STARTED', 'NOT_REQUIRED'),
+                                   (:s3, :sagaId, 3, 'DISPATCH_SHIPPING', 'NOT_STARTED', 'NOT_REQUIRED')
+                        ]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                            's1': vars.sagaId ++ '-STEP-1',
+                            's2': vars.sagaId ++ '-STEP-2',
+                            's3': vars.sagaId ++ '-STEP-3',
+                            'sagaId': vars.sagaId
+                        }]]]></db:input-parameters>
+                    </db:insert>
+                </try>
+
+                <!-- Trigger Step 1 Command over LavinMQ -->
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Step 1 Command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.inventory.command}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-1',
+                            orderId: vars.orderId,
+                            items: vars.rawPayload.items
+                        }, "application/json")]]]></amqp:body>
+                        <amqp:properties correlationId="#[vars.correlationId]" />
+                    </amqp:message>
+                </amqp:publish>
+
+                <ee:transform doc:name="Accepted Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+                        output application/json
+                        ---
+                        {
+                            sagaId: vars.sagaId,
+                            orderId: vars.orderId,
+                            sagaState: "STARTED",
+                            statusUrl: p('http.basePath') ++ "/sagas/" ++ vars.sagaId,
+                            correlationId: vars.correlationId
+                        }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="202"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Reply Listener: Step 1 Inventory -->
+    <flow name="inventory-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" 
+                       queueName="${queues.inventory.reply}" 
+                       ackMode="MANUAL" 
+                       doc:name="Listen inventory.reserve.reply" />
+
+        <set-variable variableName="ackId" value="#[attributes.ackId]" />
+        <set-variable variableName="reply" value="#[read(payload, 'application/json')]" />
+        <set-variable variableName="sagaId" value="#[vars.reply.sagaId]" />
+        <set-variable variableName="stepId" value="#[vars.reply.stepId]" />
+
+        <choice>
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_DB_Config" doc:name="Complete Step 1">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps 
+                        SET step_state = 'COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :res 
+                        WHERE step_id = :stepId;
+
+                        UPDATE saga_instances 
+                        SET current_step = 2, state_version = state_version + 1 
+                        WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'res': write(vars.reply.result, 'application/json'),
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+
+                <db:select config-ref="Saga_DB_Config" target="sagaRecord" doc:name="Read Request Payload">
+                    <db:sql><![CDATA[SELECT request_payload, order_id, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+
+                <set-variable variableName="sagaReq" value="#[read(vars.sagaRecord[0].request_payload, 'application/json')]" />
+
+                <db:update config-ref="Saga_DB_Config" doc:name="Start Step 2">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'IN_PROGRESS', command_sent_at = CURRENT_TIMESTAMP WHERE step_id = :s2]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'s2': vars.sagaId ++ '-STEP-2'}]]]></db:input-parameters>
+                </db:update>
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Step 2 Command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.payment.command}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-2',
+                            orderId: vars.sagaRecord[0].order_id,
+                            amount: vars.sagaReq.totalAmount,
+                            currency: vars.sagaReq.currency,
+                            cardToken: vars.sagaReq.payment.cardToken
+                        }, "application/json")]]]></amqp:body>
+                        <amqp:properties correlationId="#[vars.sagaRecord[0].correlation_id]" />
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+
+            <otherwise>
+                <db:update config-ref="Saga_DB_Config" doc:name="Abort Saga">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps SET step_state = 'FAILED', failure_code = :fCode WHERE step_id = :stepId;
+                        UPDATE saga_instances SET saga_state = 'ABORTED', failure_code = :fCode, failure_message = :fMsg, completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'fCode': vars.reply.failureCode default 'RESERVATION_FAILED',
+                        'fMsg': vars.reply.failureMessage default 'Inventory unavailable',
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+            </otherwise>
+        </choice>
+
+        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Reply" />
+    </flow>
+
+    <!-- Reply Listener: Step 2 Payment -->
+    <flow name="payment-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" 
+                       queueName="${queues.payment.reply}" 
+                       ackMode="MANUAL" 
+                       doc:name="Listen payment.charge.reply" />
+
+        <set-variable variableName="ackId" value="#[attributes.ackId]" />
+        <set-variable variableName="reply" value="#[read(payload, 'application/json')]" />
+        <set-variable variableName="sagaId" value="#[vars.reply.sagaId]" />
+        <set-variable variableName="stepId" value="#[vars.reply.stepId]" />
+
+        <choice>
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_DB_Config" doc:name="Complete Step 2">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps 
+                        SET step_state = 'COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :res 
+                        WHERE step_id = :stepId;
+
+                        UPDATE saga_instances 
+                        SET current_step = 3, state_version = state_version + 1 
+                        WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'res': write(vars.reply.result, 'application/json'),
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+
+                <db:select config-ref="Saga_DB_Config" target="sagaRecord" doc:name="Read Request Payload">
+                    <db:sql><![CDATA[SELECT request_payload, order_id, correlation_id FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+
+                <set-variable variableName="sagaReq" value="#[read(vars.sagaRecord[0].request_payload, 'application/json')]" />
+
+                <db:update config-ref="Saga_DB_Config" doc:name="Start Step 3">
+                    <db:sql><![CDATA[UPDATE saga_steps SET step_state = 'IN_PROGRESS', command_sent_at = CURRENT_TIMESTAMP WHERE step_id = :s3]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'s3': vars.sagaId ++ '-STEP-3'}]]]></db:input-parameters>
+                </db:update>
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Step 3 Command">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.shipping.command}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-3',
+                            orderId: vars.sagaRecord[0].order_id,
+                            recipientAddress: vars.sagaReq.shipping,
+                            serviceLevel: vars.sagaReq.shipping.serviceLevel
+                        }, "application/json")]]]></amqp:body>
+                        <amqp:properties correlationId="#[vars.sagaRecord[0].correlation_id]" />
+                    </amqp:message>
+                </amqp:publish>
+            </when>
+
+            <!-- Step 2 Failed: Compensate Step 1 (Release Reservation) -->
+            <otherwise>
+                <db:update config-ref="Saga_DB_Config" doc:name="Mark Compensating">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps SET step_state = 'FAILED', failure_code = :fCode WHERE step_id = :stepId;
+                        UPDATE saga_instances SET saga_state = 'COMPENSATING', failure_code = :fCode, failure_message = :fMsg WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'fCode': vars.reply.failureCode default 'PAYMENT_FAILED',
+                        'fMsg': vars.reply.failureMessage default 'Payment authorization declined',
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+
+                <db:select config-ref="Saga_DB_Config" target="step1Result" doc:name="Read Step 1 Reservation">
+                    <db:sql><![CDATA[SELECT result_payload FROM saga_steps WHERE saga_id = :sagaId AND step_sequence = 1]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+
+                <set-variable variableName="resPayload" value="#[read(vars.step1Result[0].result_payload, 'application/json')]" />
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Release Inventory">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.inventory.compensate}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-1',
+                            reservationId: vars.resPayload.reservationId,
+                            reason: "PAYMENT_DECLINED"
+                        }, "application/json")]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+
+                <db:update config-ref="Saga_DB_Config" doc:name="Mark Compensated">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps SET compensation_state = 'COMPENSATED', compensated_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND step_sequence = 1;
+                        UPDATE saga_instances SET saga_state = 'COMPENSATED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:update>
+            </otherwise>
+        </choice>
+
+        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Reply" />
+    </flow>
+
+    <!-- Reply Listener: Step 3 Shipping -->
+    <flow name="shipping-reply-listener-flow">
+        <amqp:listener config-ref="RabbitMQ_Config" 
+                       queueName="${queues.shipping.reply}" 
+                       ackMode="MANUAL" 
+                       doc:name="Listen shipping.dispatch.reply" />
+
+        <set-variable variableName="ackId" value="#[attributes.ackId]" />
+        <set-variable variableName="reply" value="#[read(payload, 'application/json')]" />
+        <set-variable variableName="sagaId" value="#[vars.reply.sagaId]" />
+        <set-variable variableName="stepId" value="#[vars.reply.stepId]" />
+
+        <choice>
+            <when expression="#[vars.reply.outcome == 'SUCCESS']">
+                <db:update config-ref="Saga_DB_Config" doc:name="Complete Saga">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps 
+                        SET step_state = 'COMPLETED', reply_received_at = CURRENT_TIMESTAMP, result_payload = :res 
+                        WHERE step_id = :stepId;
+
+                        UPDATE saga_instances 
+                        SET saga_state = 'COMPLETED', completed_at = CURRENT_TIMESTAMP, state_version = state_version + 1 
+                        WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'res': write(vars.reply.result, 'application/json'),
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+            </when>
+
+            <!-- Step 3 Failed: Compensate Step 2 (Refund) and Step 1 (Release) -->
+            <otherwise>
+                <db:update config-ref="Saga_DB_Config" doc:name="Mark Compensating">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps SET step_state = 'FAILED', failure_code = :fCode WHERE step_id = :stepId;
+                        UPDATE saga_instances SET saga_state = 'COMPENSATING', failure_code = :fCode, failure_message = :fMsg WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        'fCode': vars.reply.failureCode default 'SHIPPING_FAILED',
+                        'fMsg': vars.reply.failureMessage default 'Dispatch error',
+                        'stepId': vars.stepId,
+                        'sagaId': vars.sagaId
+                    }]]]></db:input-parameters>
+                </db:update>
+
+                <!-- Unwind Step 2 -->
+                <db:select config-ref="Saga_DB_Config" target="step2Result" doc:name="Read Step 2 Payment">
+                    <db:sql><![CDATA[SELECT result_payload FROM saga_steps WHERE saga_id = :sagaId AND step_sequence = 2]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+                <set-variable variableName="payPayload" value="#[read(vars.step2Result[0].result_payload, 'application/json')]" />
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Refund Payment">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.payment.compensate}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-2',
+                            paymentId: vars.payPayload.paymentId,
+                            reason: "SHIPPING_FAILED"
+                        }, "application/json")]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+
+                <!-- Unwind Step 1 -->
+                <db:select config-ref="Saga_DB_Config" target="step1Result" doc:name="Read Step 1 Reservation">
+                    <db:sql><![CDATA[SELECT result_payload FROM saga_steps WHERE saga_id = :sagaId AND step_sequence = 1]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+                <set-variable variableName="resPayload" value="#[read(vars.step1Result[0].result_payload, 'application/json')]" />
+
+                <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Release Inventory">
+                    <amqp:routing-keys>
+                        <amqp:routing-key value="${queues.inventory.compensate}" />
+                    </amqp:routing-keys>
+                    <amqp:message>
+                        <amqp:body><![CDATA[#[write({
+                            sagaId: vars.sagaId,
+                            stepId: vars.sagaId ++ '-STEP-1',
+                            reservationId: vars.resPayload.reservationId,
+                            reason: "SHIPPING_FAILED"
+                        }, "application/json")]]]></amqp:body>
+                    </amqp:message>
+                </amqp:publish>
+
+                <db:update config-ref="Saga_DB_Config" doc:name="Mark Saga Compensated">
+                    <db:sql><![CDATA[
+                        UPDATE saga_steps SET compensation_state = 'COMPENSATED', compensated_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId AND step_sequence IN (1, 2);
+                        UPDATE saga_instances SET saga_state = 'COMPENSATED', completed_at = CURRENT_TIMESTAMP WHERE saga_id = :sagaId;
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:update>
+            </otherwise>
+        </choice>
+
+        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Reply" />
+    </flow>
+
+    <!-- GET /sagas/{sagaId} -->
+    <flow name="get:\sagas\(sagaId):saga-orchestrator-process-api-config">
+        <set-variable variableName="sagaId" value="#[attributes.uriParams.sagaId]"/>
+        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
+
+        <db:select config-ref="Saga_DB_Config" target="sagaHeader" doc:name="Select saga_instance">
+            <db:sql><![CDATA[SELECT * FROM saga_instances WHERE saga_id = :sagaId]]></db:sql>
+            <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+        </db:select>
+
+        <choice>
+            <when expression="#[isEmpty(vars.sagaHeader)]">
+                <ee:transform doc:name="404 Not Found">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+                        output application/json
+                        ---
+                        {
+                            errorCode: "SAGA_NOT_FOUND",
+                            errorMessage: "No saga found for id: " ++ vars.sagaId,
+                            correlationId: vars.correlationId,
+                            timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                        }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="404"/>
+            </when>
+
+            <otherwise>
+                <db:select config-ref="Saga_DB_Config" target="sagaSteps" doc:name="Select saga_steps">
+                    <db:sql><![CDATA[SELECT * FROM saga_steps WHERE saga_id = :sagaId ORDER BY step_sequence ASC]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{'sagaId': vars.sagaId}]]]></db:input-parameters>
+                </db:select>
+
+                <ee:transform doc:name="Format Status Payload">
+				    <ee:message>
+				        <ee:set-payload><![CDATA[%dw 2.0
+				        output application/json
+				        var header = vars.sagaHeader[0]
+				        fun formatTimestamp(ts) = 
+				            if (isEmpty(ts)) null 
+				            else (ts as String {format: "yyyy-MM-dd'T'HH:mm:ss"}) ++ "Z"
+				        ---
+				        {
+				            sagaId: header.saga_id,
+				            orderId: header.order_id,
+				            sagaState: header.saga_state,
+				            startedAt: formatTimestamp(header.started_at),
+				            completedAt: formatTimestamp(header.completed_at),
+				            failureCode: header.failure_code,
+				            failureMessage: header.failure_message,
+				            steps: vars.sagaSteps default [] map (s) -> {
+				                stepSequence: s.step_sequence,
+				                stepName: s.step_name,
+				                stepState: s.step_state,
+				                attemptCount: s.attempt_count,
+				                result: if (!isEmpty(s.result_payload)) read(s.result_payload, "application/json") else null,
+				                compensationState: s.compensation_state,
+				                compensatedAt: formatTimestamp(s.compensated_at),
+				                failureCode: s.failure_code
+				            },
+				            correlationId: header.correlation_id
+				        }]]></ee:set-payload>
+				    </ee:message>
+				</ee:transform>
+                <set-variable variableName="httpStatus" value="200"/>
+            </otherwise>
+        </choice>
+    </flow>
+</mule>

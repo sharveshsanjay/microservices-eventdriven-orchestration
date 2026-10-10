@@ -1,0 +1,60 @@
+#%RAML 1.0 DataType
+type: object
+properties:
+  sagaId:
+    type: string
+    example: "SAGA-2026-0000771"
+  orderId:
+    type: string
+    example: "ORD-2026-1001"
+  sagaState:
+    type: string
+    example: "COMPENSATED"
+  startedAt:
+    type: string
+    example: "2026-09-11T17:02:10.001+05:30"
+  completedAt?:
+    type: string
+    example: "2026-09-11T17:02:14.663+05:30"
+  failureCode?:
+    type: string
+    example: "PAYMENT_DECLINED"
+  failureMessage?:
+    type: string
+    example: "Issuer declined the transaction"
+  steps:
+    type: array
+    items:
+      type: object
+      properties:
+        stepSequence:
+          type: integer
+          example: 1
+        stepName:
+          type: string
+          example: "RESERVE_INVENTORY"
+        stepState:
+          type: string
+          example: "COMPLETED"
+        attemptCount:
+          type: integer
+          example: 1
+        result?:
+          type: object
+          properties:
+            reservationId?: string
+            paymentId?: string
+            dispatchId?: string
+            expiresAt?: string
+        compensationState?:
+          type: string
+          example: "COMPENSATED"
+        compensatedAt?:
+          type: string
+          example: "2026-09-11T17:02:14.518+05:30"
+        failureCode?:
+          type: string
+          example: "PAYMENT_DECLINED"
+  correlationId:
+    type: string
+    example: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"

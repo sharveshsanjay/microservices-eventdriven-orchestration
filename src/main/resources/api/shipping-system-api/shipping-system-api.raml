@@ -1,0 +1,51 @@
+#%RAML 1.0
+title: Shipping System API
+version: v1.0.0
+description: Coordinates package dispatches, courier consignment numbers, and delivery halts.
+mediaType: [application/json]
+protocols: [HTTP, HTTPS]
+
+traits:
+  stepTraceable: !include traits/headers.raml
+
+types:
+  DispatchRequest: !include types/shipping-dispatch-req.raml
+  DispatchResponse: !include types/shipping-dispatch-res.raml
+  CancelRequest: !include types/shipping-cancel-req.raml
+
+/shipping:
+  /dispatch:
+    post:
+      displayName: Dispatch Consignment
+      is: [stepTraceable]
+      body:
+        application/json:
+          type: DispatchRequest
+      responses:
+        201:
+          body:
+            application/json:
+              type: DispatchResponse
+              example:
+                dispatchId: "DSP-2026-88412"
+                trackingNumber: "TRK-IN-90812347"
+                carrier: "BlueDart"
+                status: "DISPATCHED"
+
+  /cancel:
+    post:
+      displayName: Compensate - Cancel Consignment
+      is: [stepTraceable]
+      body:
+        application/json:
+          type: CancelRequest
+          example:
+            dispatchId: "DSP-2026-88412"
+            reason: "SAGA_COMPENSATION"
+      responses:
+        200:
+          body:
+            application/json:
+              example:
+                dispatchId: "DSP-2026-88412"
+                status: "CANCELLED"

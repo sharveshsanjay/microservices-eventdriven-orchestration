@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <apikit:config name="order-experience-api-config" 
+                   api="order-experience-api/order-experience-api.raml" 
+                   outboundHeadersMapName="outboundHeaders" 
+                   httpStatusVarName="httpStatus" />
+
+    <flow name="order-experience-api-main">
+        <http:listener config-ref="HTTP_Listener_config" path="/orders-api/*">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[vars.outboundHeaders default {} ++ {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': '*'
+                }]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body>#[payload]</http:body>
+                <http:headers>#[vars.outboundHeaders default {} ++ {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': '*'
+                }]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <!-- Intercept CORS Preflight before APIKit -->
+        <choice doc:name="Check for Preflight OPTIONS">
+            <when expression="#[attributes.method == 'OPTIONS']">
+                <set-variable variableName="httpStatus" value="200" doc:name="Set 200 OK"/>
+                <set-payload value="#['']" doc:name="Empty Payload"/>
+            </when>
+            <otherwise>
+                <apikit:router config-ref="order-experience-api-config" />
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- POST /orders -->
+    <flow name="post:\orders:application\json:order-experience-api-config">
+        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
+        <set-variable variableName="inboundOrder" value="#[payload]"/>
+
+        <http:request method="POST" 
+                      config-ref="HTTP_Request_configuration" 
+                      path="/api/v1/sagas/order-fulfilment" 
+                      doc:name="Invoke Process API">
+            <http:body>#[vars.inboundOrder]</http:body>
+            <http:headers>#[{
+                'x-correlation-id': vars.correlationId,
+                'Content-Type': 'application/json'
+            }]</http:headers>
+        </http:request>
+
+        <ee:transform doc:name="Build Experience Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+                output application/json
+                ---
+                {
+                    orderId: payload.orderId,
+                    sagaId: payload.sagaId,
+                    orderStatus: "PROCESSING",
+                    statusUrl: "/orders/" ++ payload.orderId ++ "/status",
+                    correlationId: vars.correlationId
+                }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="httpStatus" value="202"/>
+    </flow>
+
+    <!-- GET /orders/{orderId}/status -->
+    <flow name="get:\orders\(orderId)\status:order-experience-api-config">
+        <set-variable variableName="orderId" value="#[attributes.uriParams.orderId]"/>
+        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
+
+        <ee:transform doc:name="Return Status">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+                output application/json
+                ---
+                {
+                    orderId: vars.orderId,
+                    status: "IN_PROGRESS",
+                    updatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="httpStatus" value="200"/>
+    </flow>
+</mule>

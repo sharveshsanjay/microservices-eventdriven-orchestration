@@ -1,0 +1,46 @@
+#%RAML 1.0
+title: Order Experience API
+version: v1.0.0
+description: Edge API consumed by e-commerce frontends and mobile clients.
+mediaType: [application/json]
+protocols: [HTTP, HTTPS]
+
+traits:
+  secured: !include traits/client-auth.raml
+  traceable: !include traits/correlation.raml
+
+types:
+  OrderRequest: !include types/order-request.raml
+  OrderResponse: !include types/order-response.raml
+
+/orders:
+  post:
+    displayName: Submit New Order
+    is: [secured, traceable]
+    body:
+      application/json:
+        type: OrderRequest
+    responses:
+      202:
+        body:
+          application/json:
+            type: OrderResponse
+            example:
+              orderId: "ORD-2026-1001"
+              sagaId: "SAGA-2026-0000771"
+              orderStatus: "PROCESSING"
+              statusUrl: "/orders/ORD-2026-1001/status"
+              correlationId: "6e0a9c34-71bd-4e28-b9f5-3c7188a0e412"
+
+  /{orderId}/status:
+    get:
+      displayName: Check Order Status
+      is: [secured, traceable]
+      responses:
+        200:
+          body:
+            application/json:
+              example:
+                orderId: "ORD-2026-1001"
+                status: "COMPLETED"
+                updatedAt: "2026-09-11T17:02:14.663+05:30"

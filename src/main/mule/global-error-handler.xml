@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <error-handler name="global-error-handler" doc:name="Global Error Handler">
+        <!-- 1. APIkit Bad Request (Missing fields, invalid schema) -->
+        <on-error-propagate type="APIKIT:BAD_REQUEST" enableNotifications="true" logException="true">
+            <ee:transform doc:name="Format 400 Error">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorCode: "INVALID_REQUEST_PAYLOAD",
+                        errorMessage: error.description default "Bad Request",
+                        correlationId: vars.correlationId default correlationId,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                    }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <set-variable variableName="httpStatus" value="400"/>
+        </on-error-propagate>
+
+        <!-- 2. APIkit Resource Not Found -->
+        <on-error-propagate type="APIKIT:NOT_FOUND" enableNotifications="true" logException="true">
+            <ee:transform doc:name="Format 404 Error">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorCode: "RESOURCE_NOT_FOUND",
+                        errorMessage: "The requested API endpoint was not found.",
+                        correlationId: vars.correlationId default correlationId,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                    }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <set-variable variableName="httpStatus" value="404"/>
+        </on-error-propagate>
+
+        <!-- 3. Technical Database Connectivity Failure (Retryable category) -->
+        <on-error-propagate type="DB:CONNECTIVITY, DB:RETRY_EXHAUSTED" enableNotifications="true" logException="true">
+            <ee:transform doc:name="Format 503 DB Error">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorCode: "DATABASE_UNAVAILABLE",
+                        errorMessage: "Transient database failure. Please retry shortly.",
+                        correlationId: vars.correlationId default correlationId,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                    }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <set-variable variableName="httpStatus" value="503"/>
+        </on-error-propagate>
+
+        <!-- 4. Downstream Service Connectivity Failure -->
+        <on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" enableNotifications="true" logException="true">
+            <ee:transform doc:name="Format 504 Timeout Error">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorCode: "DOWNSTREAM_TIMEOUT",
+                        errorMessage: "Timeout communicating with downstream system service.",
+                        correlationId: vars.correlationId default correlationId,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                    }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <set-variable variableName="httpStatus" value="504"/>
+        </on-error-propagate>
+
+        <!-- 5. Default Catch-All Technical Error -->
+        <on-error-propagate type="ANY" enableNotifications="true" logException="true">
+            <ee:transform doc:name="Format 500 Generic Error">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+                    output application/json
+                    ---
+                    {
+                        errorCode: "INTERNAL_SERVER_ERROR",
+                        errorMessage: error.description default "An unexpected error occurred during execution.",
+                        correlationId: vars.correlationId default correlationId,
+                        timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+                    }]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <set-variable variableName="httpStatus" value="500"/>
+        </on-error-propagate>
+    </error-handler>
+
+</mule>

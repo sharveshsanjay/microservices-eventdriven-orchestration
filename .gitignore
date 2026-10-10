@@ -1,0 +1,8 @@
+target/
+.settings/
+.classpath
+.project
+.env
+*.jks
+*.keystore
+src/main/resources/application.yaml

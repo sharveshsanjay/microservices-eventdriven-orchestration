@@ -1,0 +1,59 @@
+#%RAML 1.0 DataType
+type: object
+properties:
+  orderId:
+    type: string
+    example: "ORD-2026-1001"
+  customerId:
+    type: string
+    example: "CUST-501"
+  currency:
+    type: string
+    example: "INR"
+  totalAmount:
+    type: number
+    example: 3797.00
+  items:
+    type: array
+    items:
+      type: object
+      properties:
+        sku:
+          type: string
+          example: "SKU-TSHIRT-BLK-M"
+        quantity:
+          type: integer
+          example: 2
+        unitPrice:
+          type: number
+          example: 1499.00
+  payment:
+    type: object
+    properties:
+      method:
+        type: string
+        example: "CARD"
+      cardToken:
+        type: string
+        example: "TKN-4d9a77e1c0"
+  shipping:
+    type: object
+    properties:
+      addressLine1:
+        type: string
+        example: "21 Anna Salai"
+      city:
+        type: string
+        example: "Chennai"
+      state:
+        type: string
+        example: "Tamil Nadu"
+      postalCode:
+        type: string
+        example: "600002"
+      country:
+        type: string
+        example: "India"
+      serviceLevel:
+        type: string
+        example: "STANDARD"

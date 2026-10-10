@@ -1,0 +1,84 @@
+#%RAML 1.0
+title: Saga Orchestrator Process API
+version: v1.0.0
+
+resourceTypes:
+  resourceType: {}
+description: Core saga coordinator handling the state machine, messaging workflows, and compensation ordering.
+mediaType: [application/json]
+protocols: [HTTP, HTTPS]
+
+traits:
+  trackable: !include traits/tracking.raml
+
+types:
+  SagaRequest: !include types/saga-request.raml
+  SagaInitResponse: !include types/saga-init-response.raml
+  SagaStatusResponse: !include types/saga-status-response.raml
+
+/sagas:
+  /order-fulfilment:
+    post:
+      displayName: Initiate Order Saga
+      is:
+        - trackable
+      body:
+        application/json:
+          type: SagaRequest
+      responses:
+        "202":
+          body:
+            application/json:
+              type: SagaInitResponse
+              example:
+                sagaId: SAGA-2026-0000771
+                orderId: ORD-2026-1001
+                sagaState: STARTED
+                statusUrl: /api/v1/sagas/SAGA-2026-0000771
+                correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+  /{sagaId}:
+    uriParameters:
+      sagaId:
+        type: string
+        example: SAGA-2026-0000771
+    get:
+      displayName: Query Saga State
+      is:
+        - trackable
+      responses:
+        "200":
+          body:
+            application/json:
+              example:
+                sagaId: SAGA-2026-0000771
+                orderId: ORD-2026-1001
+                sagaState: COMPENSATED
+                startedAt: 2026-09-11T17:02:10.001+05:30
+                completedAt: 2026-09-11T17:02:14.663+05:30
+                failureCode: PAYMENT_DECLINED
+                failureMessage: Issuer declined the transaction
+                steps:
+                  -
+                    stepSequence: 1
+                    stepName: RESERVE_INVENTORY
+                    stepState: COMPLETED
+                    attemptCount: 1
+                    result:
+                      reservationId: RSV-2026-558102
+                    compensationState: COMPENSATED
+                    compensatedAt: 2026-09-11T17:02:14.518+05:30
+                  -
+                    stepSequence: 2
+                    stepName: CHARGE_PAYMENT
+                    stepState: FAILED
+                    attemptCount: 3
+                    failureCode: PAYMENT_DECLINED
+                    compensationState: NOT_REQUIRED
+                  -
+                    stepSequence: 3
+                    stepName: DISPATCH_SHIPPING
+                    stepState: NOT_STARTED
+                    compensationState: NOT_REQUIRED
+                correlationId: 6e0a9c34-71bd-4e28-b9f5-3c7188a0e412
+              type: object
+  type: resourceType

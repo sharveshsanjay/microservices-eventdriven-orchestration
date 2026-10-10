@@ -1,0 +1,38 @@
+#%RAML 1.0 DataType
+type: object
+properties:
+  orderId:
+    type: string
+    required: true
+    example: "ORD-2026-1001"
+  customerId:
+    type: string
+    required: true
+    example: "CUST-501"
+  currency:
+    type: string
+    required: true
+    example: "INR"
+  totalAmount:
+    type: number
+    required: true
+    example: 3797.00
+  items:
+    type: array
+    items:
+      properties:
+        sku: string
+        quantity: integer
+        unitPrice: number
+  payment:
+    properties:
+      method: string
+      cardToken: string
+  shipping:
+    properties:
+      addressLine1: string
+      city: string
+      state: string
+      postalCode: string
+      country: string
+      serviceLevel: string
