@@ -22,36 +22,51 @@
                        ackMode="MANUAL" 
                        doc:name="Listen payment.charge.command" />
 
-        <set-variable variableName="ackId" value="#[attributes.ackId]" />
-        <set-variable variableName="msgPayload" value="#[read(payload, 'application/json')]" />
-        <set-variable variableName="sagaId" value="#[vars.msgPayload.sagaId]" />
-        <set-variable variableName="stepId" value="#[vars.msgPayload.stepId]" />
-        <set-variable variableName="orderId" value="#[vars.msgPayload.orderId]" />
-        <set-variable variableName="correlationId" value="#[attributes.properties.correlationId default uuid()]" />
-        <set-variable variableName="dedupKey" value="#[vars.stepId ++ '_CHARGE']" />
+        <!-- Consolidated Context -->
+        <ee:transform doc:name="Init Worker Context">
+            <ee:variables>
+                <ee:set-variable variableName="tx"><![CDATA[%dw 2.0
+output application/json
+var msg = if (payload is Binary or payload is String) read(payload, 'application/json') else payload
+var sId = msg.stepId default ""
+---
+{
+    ackId: attributes.ackId,
+    msgPayload: msg,
+    sagaId: msg.sagaId,
+    stepId: sId,
+    orderId: msg.orderId,
+    amount: msg.amount,
+    currency: msg.currency default "INR",
+    cardToken: msg.cardToken default "",
+    correlationId: attributes.properties.correlationId default uuid(),
+    dedupKey: sId ++ "_CHARGE",
+    paymentId: "PAY-" ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5]),
+    gatewayRef: "GTW-TXN-" ++ upper(uuid()[0 to 5])
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
 
-        <!-- Check for Simulated Step 2 Failure -->
+        <!-- Simulated Step 2 Failure Trigger -->
         <choice doc:name="Check for Simulated Failure">
-            <when expression="#[vars.msgPayload.cardToken == 'TKN-DECLINE']">
+            <when expression="#[vars.tx.cardToken == 'TKN-DECLINE']">
                 <raise-error type="CUSTOM:PAYMENT_DECLINED" 
                              description="Payment authorization declined: Insufficient funds or invalid card token" 
                              doc:name="Raise Payment Error" />
             </when>
         </choice>
-        
+
+        <!-- Deduplication Check -->
         <db:select config-ref="Payment_DB_Config" target="cachedCommand" doc:name="Check Dedup">
             <db:sql><![CDATA[SELECT result_payload FROM processed_commands WHERE dedup_key = :dedupKey]]></db:sql>
-            <db:input-parameters><![CDATA[#[{'dedupKey': vars.dedupKey}]]]></db:input-parameters>
+            <db:input-parameters><![CDATA[#[{'dedupKey': vars.tx.dedupKey}]]]></db:input-parameters>
         </db:select>
 
-        <choice>
+        <choice doc:name="Check Cached Command">
             <when expression="#[!isEmpty(vars.cachedCommand)]">
                 <set-variable variableName="stepResult" value="#[read(vars.cachedCommand[0].result_payload, 'application/json')]" />
             </when>
             <otherwise>
-                <set-variable variableName="paymentId" value="#['PAY-' ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5])]" />
-                <set-variable variableName="gatewayRef" value="#['GTW-TXN-' ++ upper(uuid()[0 to 5])]" />
-
                 <try doc:name="Atomic Try Scope" transactionalAction="ALWAYS_BEGIN">
                     <db:insert config-ref="Payment_DB_Config" doc:name="Insert Transaction">
                         <db:sql><![CDATA[
@@ -62,26 +77,25 @@
                             )
                         ]]></db:sql>
                         <db:input-parameters><![CDATA[#[{
-                            'pId': vars.paymentId,
-                            'orderId': vars.orderId,
-                            'amt': vars.msgPayload.amount,
-                            'curr': vars.msgPayload.currency default 'INR',
-                            'gwRef': vars.gatewayRef
+                            'pId': vars.tx.paymentId,
+                            'orderId': vars.tx.orderId,
+                            'amt': vars.tx.amount,
+                            'curr': vars.tx.currency,
+                            'gwRef': vars.tx.gatewayRef
                         }]]]></db:input-parameters>
                     </db:insert>
 
                     <ee:transform doc:name="Set Result Payload">
-                        <ee:message />
                         <ee:variables>
                             <ee:set-variable variableName="stepResult"><![CDATA[%dw 2.0
-                            output application/json
-                            ---
-                            {
-                                paymentId: vars.paymentId,
-                                orderId: vars.orderId,
-                                status: "CHARGED",
-                                gatewayRef: vars.gatewayRef
-                            }]]></ee:set-variable>
+output application/json
+---
+{
+    paymentId: vars.tx.paymentId,
+    orderId: vars.tx.orderId,
+    status: "CHARGED",
+    gatewayRef: vars.tx.gatewayRef
+}]]></ee:set-variable>
                         </ee:variables>
                     </ee:transform>
 
@@ -91,8 +105,8 @@
                             VALUES (:dedupKey, :stepId, 'CHARGE', :res, CURRENT_TIMESTAMP)
                         ]]></db:sql>
                         <db:input-parameters><![CDATA[#[{
-                            'dedupKey': vars.dedupKey,
-                            'stepId': vars.stepId,
+                            'dedupKey': vars.tx.dedupKey,
+                            'stepId': vars.tx.stepId,
                             'res': write(vars.stepResult, 'application/json')
                         }]]]></db:input-parameters>
                     </db:insert>
@@ -108,16 +122,16 @@
             <amqp:message>
                 <amqp:body><![CDATA[#[write({
                     outcome: "SUCCESS",
-                    sagaId: vars.sagaId,
-                    stepId: vars.stepId,
-                    orderId: vars.orderId,
+                    sagaId: vars.tx.sagaId,
+                    stepId: vars.tx.stepId,
+                    orderId: vars.tx.orderId,
                     result: vars.stepResult
                 }, "application/json")]]]></amqp:body>
-                <amqp:properties correlationId="#[vars.correlationId]" />
+                <amqp:properties correlationId="#[vars.tx.correlationId]" />
             </amqp:message>
         </amqp:publish>
 
-        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Command" />
+        <amqp:ack ackId="#[vars.tx.ackId]" doc:name="Ack Command" />
 
         <error-handler>
             <on-error-continue enableNotifications="true" logException="true">
@@ -128,16 +142,16 @@
                     <amqp:message>
                         <amqp:body><![CDATA[#[write({
                             outcome: "FAILURE",
-                            sagaId: vars.sagaId,
-                            stepId: vars.stepId,
-                            orderId: vars.orderId,
+                            sagaId: vars.tx.sagaId,
+                            stepId: vars.tx.stepId,
+                            orderId: vars.tx.orderId,
                             failureCode: "PAYMENT_DECLINED",
                             failureMessage: error.description default "Payment gateway authorization declined"
                         }, "application/json")]]]></amqp:body>
-                        <amqp:properties correlationId="#[vars.correlationId]" />
+                        <amqp:properties correlationId="#[vars.tx.correlationId default uuid()]" />
                     </amqp:message>
                 </amqp:publish>
-                <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Failed Message" />
+                <amqp:ack ackId="#[vars.tx.ackId default attributes.ackId]" doc:name="Ack Failed Message" />
             </on-error-continue>
         </error-handler>
     </flow>
@@ -149,12 +163,22 @@
                        ackMode="MANUAL" 
                        doc:name="Listen payment.refund.command" />
 
-        <set-variable variableName="ackId" value="#[attributes.ackId]" />
-        <set-variable variableName="msgPayload" value="#[read(payload, 'application/json')]" />
-        <set-variable variableName="pId" value="#[vars.msgPayload.paymentId]" />
-        <set-variable variableName="stepId" value="#[vars.msgPayload.stepId]" />
-        <set-variable variableName="refundId" value="#['REF-' ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5])]" />
-        <set-variable variableName="dedupKey" value="#[vars.stepId ++ '_REFUND']" />
+        <ee:transform doc:name="Init Compensation Context">
+            <ee:variables>
+                <ee:set-variable variableName="compTx"><![CDATA[%dw 2.0
+output application/json
+var msg = if (payload is Binary or payload is String) read(payload, 'application/json') else payload
+var sId = msg.stepId default ""
+---
+{
+    ackId: attributes.ackId,
+    pId: msg.paymentId,
+    stepId: sId,
+    refundId: "REF-" ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5]),
+    dedupKey: sId ++ "_REFUND"
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
 
         <try doc:name="Atomic Try Scope" transactionalAction="ALWAYS_BEGIN">
             <db:update config-ref="Payment_DB_Config" doc:name="Set Payment REFUNDED">
@@ -164,8 +188,8 @@
                     WHERE payment_id = :pId
                 ]]></db:sql>
                 <db:input-parameters><![CDATA[#[{
-                    'pId': vars.pId,
-                    'refId': vars.refundId
+                    'pId': vars.compTx.pId,
+                    'refId': vars.compTx.refundId
                 }]]]></db:input-parameters>
             </db:update>
 
@@ -175,12 +199,12 @@
                     VALUES (:dedupKey, :stepId, 'COMPENSATE_REFUND', '{"status":"REFUNDED"}', CURRENT_TIMESTAMP)
                 ]]></db:sql>
                 <db:input-parameters><![CDATA[#[{
-                    'dedupKey': vars.dedupKey,
-                    'stepId': vars.stepId
+                    'dedupKey': vars.compTx.dedupKey,
+                    'stepId': vars.compTx.stepId
                 }]]]></db:input-parameters>
             </db:insert>
         </try>
 
-        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Refund Message" />
+        <amqp:ack ackId="#[vars.compTx.ackId]" doc:name="Ack Refund Message" />
     </flow>
 </mule>

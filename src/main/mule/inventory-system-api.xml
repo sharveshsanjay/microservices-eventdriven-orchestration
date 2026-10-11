@@ -22,18 +22,42 @@
                        ackMode="MANUAL" 
                        doc:name="Listen inventory.reserve.command" />
 
-        <set-variable variableName="ackId" value="#[attributes.ackId]" />
-        <set-variable variableName="msgPayload" value="#[if (payload is Binary or payload is String) read(payload, 'application/json') else payload]" />
-        <set-variable variableName="sagaId" value="#[vars.msgPayload.sagaId]" />
-        <set-variable variableName="stepId" value="#[vars.msgPayload.stepId]" />
-        <set-variable variableName="orderId" value="#[vars.msgPayload.orderId]" />
-        <set-variable variableName="correlationId" value="#[attributes.properties.correlationId default uuid()]" />
-        <set-variable variableName="dedupKey" value="#[vars.stepId ++ '_RESERVE']" />
+        <!-- Consolidated Context -->
+        <ee:transform doc:name="Init Worker Context">
+            <ee:variables>
+                <ee:set-variable variableName="tx"><![CDATA[%dw 2.0
+output application/json
+var msg = if (payload is Binary or payload is String) read(payload, 'application/json') else payload
+var sId = msg.stepId default ""
+---
+{
+    ackId: attributes.ackId,
+    msgPayload: msg,
+    sagaId: msg.sagaId,
+    stepId: sId,
+    orderId: msg.orderId,
+    correlationId: attributes.properties.correlationId default uuid(),
+    dedupKey: sId ++ "_RESERVE",
+    targetSku: msg.items[0].sku default "UNKNOWN",
+    targetQty: (msg.items[0].quantity default 1) as Number,
+    reservationId: "RSV-" ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5])
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
 
-        <!-- 1. Local Idempotency / Deduplication Check -->
+        <!-- Simulated Step 1 Failure Trigger -->
+        <choice doc:name="Check for Simulated Failure">
+            <when expression="#[vars.tx.targetSku == 'SKU-OUT-OF-STOCK' or vars.tx.targetQty &gt;= 9999]">
+                <raise-error type="CUSTOM:INVENTORY_OUT_OF_STOCK" 
+                             description="Inventory allocation failed: Item is out of stock" 
+                             doc:name="Raise Stock Error"/>
+            </when>
+        </choice>
+
+        <!-- Idempotency & Deduplication Check -->
         <db:select config-ref="Inventory_DB_Config" target="cachedCommand" doc:name="Check Dedup">
             <db:sql><![CDATA[SELECT result_payload FROM processed_commands WHERE dedup_key = :dedupKey]]></db:sql>
-            <db:input-parameters><![CDATA[#[{'dedupKey': vars.dedupKey}]]]></db:input-parameters>
+            <db:input-parameters><![CDATA[#[{'dedupKey': vars.tx.dedupKey}]]]></db:input-parameters>
         </db:select>
 
         <choice doc:name="Check Cached Command">
@@ -41,21 +65,7 @@
                 <set-variable variableName="stepResult" value="#[read(vars.cachedCommand[0].result_payload, 'application/json')]" />
             </when>
             <otherwise>
-                <set-variable variableName="reservationId" value="#['RSV-' ++ now() as String {format: 'yyyy'} ++ '-' ++ upper(uuid()[0 to 5])]" />
-                <set-variable variableName="targetSku" value="#[vars.msgPayload.items[0].sku default 'UNKNOWN']" />
-                <set-variable variableName="targetQty" value="#[(vars.msgPayload.items[0].quantity default 1) as Number]" />
-				
-				<!-- Check for Simulated Step 1 Failure -->
-                <choice doc:name="Check for Simulated Failure">
-                    <when expression="#[vars.targetSku == 'SKU-OUT-OF-STOCK' or vars.targetQty &gt;= 9999]">
-                        <raise-error type="CUSTOM:INVENTORY_OUT_OF_STOCK" 
-                                     description="Inventory allocation failed: Item is out of stock" 
-                                     doc:name="Raise Stock Error"/>
-                    </when>
-                </choice>
-                
                 <try doc:name="Atomic Try Scope" transactionalAction="ALWAYS_BEGIN">
-                    <!-- Insert Inventory Reservation -->
                     <db:insert config-ref="Inventory_DB_Config" doc:name="Insert Reservation">
                         <db:sql><![CDATA[
                             INSERT INTO inventory_reservations (
@@ -66,36 +76,34 @@
                             )
                         ]]></db:sql>
                         <db:input-parameters><![CDATA[#[{
-                            'resId': vars.reservationId,
-                            'orderId': vars.orderId,
-                            'sku': vars.targetSku,
-                            'qty': vars.targetQty
+                            'resId': vars.tx.reservationId,
+                            'orderId': vars.tx.orderId,
+                            'sku': vars.tx.targetSku,
+                            'qty': vars.tx.targetQty
                         }]]]></db:input-parameters>
                     </db:insert>
 
-                    <!-- Build Step Result Object (Output as Java Map for clean serialization) -->
                     <ee:transform doc:name="Set Result Payload">
                         <ee:variables>
                             <ee:set-variable variableName="stepResult"><![CDATA[%dw 2.0
-                            output application/java
-                            ---
-                            {
-                                reservationId: vars.reservationId,
-                                status: "RESERVED",
-                                expiresAt: (now() + |PT30M|) as String {format: "yyyy-MM-dd'T'HH:mm:ss'Z'"}
-                            }]]></ee:set-variable>
+output application/json
+---
+{
+    reservationId: vars.tx.reservationId,
+    status: "RESERVED",
+    expiresAt: (now() + |PT30M|) as String {format: "yyyy-MM-dd'T'HH:mm:ss'Z'"}
+}]]></ee:set-variable>
                         </ee:variables>
                     </ee:transform>
 
-                    <!-- Store Result in Local Deduplication Table -->
                     <db:insert config-ref="Inventory_DB_Config" doc:name="Record Dedup">
                         <db:sql><![CDATA[
                             INSERT INTO processed_commands (dedup_key, step_id, command_type, result_payload, processed_at)
                             VALUES (:dedupKey, :stepId, 'RESERVE', :res, CURRENT_TIMESTAMP)
                         ]]></db:sql>
                         <db:input-parameters><![CDATA[#[{
-                            'dedupKey': vars.dedupKey,
-                            'stepId': vars.stepId,
+                            'dedupKey': vars.tx.dedupKey,
+                            'stepId': vars.tx.stepId,
                             'res': write(vars.stepResult, 'application/json')
                         }]]]></db:input-parameters>
                     </db:insert>
@@ -103,7 +111,7 @@
             </otherwise>
         </choice>
 
-        <!-- 2. Publish Success Reply to LavinMQ -->
+        <!-- Publish Success Reply -->
         <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish inventory.reserve.reply">
             <amqp:routing-keys>
                 <amqp:routing-key value="${queues.inventory.reply}" />
@@ -111,21 +119,19 @@
             <amqp:message>
                 <amqp:body><![CDATA[#[write({
                     outcome: "SUCCESS",
-                    sagaId: vars.sagaId,
-                    stepId: vars.stepId,
-                    orderId: vars.orderId,
+                    sagaId: vars.tx.sagaId,
+                    stepId: vars.tx.stepId,
+                    orderId: vars.tx.orderId,
                     result: vars.stepResult
                 }, "application/json")]]]></amqp:body>
-                <amqp:properties correlationId="#[vars.correlationId]" />
+                <amqp:properties correlationId="#[vars.tx.correlationId]" />
             </amqp:message>
         </amqp:publish>
 
-        <!-- Acknowledge Message Delivery -->
-        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Command" />
+        <amqp:ack ackId="#[vars.tx.ackId]" doc:name="Ack Command" />
 
         <error-handler>
             <on-error-continue enableNotifications="true" logException="true">
-                <!-- Publish Failure Reply on Exception -->
                 <amqp:publish config-ref="RabbitMQ_Config" doc:name="Publish Failure Reply">
                     <amqp:routing-keys>
                         <amqp:routing-key value="${queues.inventory.reply}" />
@@ -133,17 +139,16 @@
                     <amqp:message>
                         <amqp:body><![CDATA[#[write({
                             outcome: "FAILURE",
-                            sagaId: vars.sagaId,
-                            stepId: vars.stepId,
-                            orderId: vars.orderId,
+                            sagaId: vars.tx.sagaId,
+                            stepId: vars.tx.stepId,
+                            orderId: vars.tx.orderId,
                             failureCode: "INVENTORY_RESERVATION_FAILED",
                             failureMessage: error.description default "Inventory allocation failed"
                         }, "application/json")]]]></amqp:body>
-                        <amqp:properties correlationId="#[vars.correlationId default uuid()]" />
+                        <amqp:properties correlationId="#[vars.tx.correlationId default uuid()]" />
                     </amqp:message>
                 </amqp:publish>
-                <!-- Acknowledge original message to prevent infinite retry loops -->
-                <amqp:ack ackId="#[vars.ackId default attributes.ackId]" doc:name="Ack Failed Message" />
+                <amqp:ack ackId="#[vars.tx.ackId default attributes.ackId]" doc:name="Ack Failed Message" />
             </on-error-continue>
         </error-handler>
     </flow>
@@ -155,21 +160,30 @@
                        ackMode="MANUAL" 
                        doc:name="Listen inventory.release.command" />
 
-        <set-variable variableName="ackId" value="#[attributes.ackId]" />
-        <set-variable variableName="msgPayload" value="#[if (payload is Binary or payload is String) read(payload, 'application/json') else payload]" />
-        <set-variable variableName="resId" value="#[vars.msgPayload.reservationId]" />
-        <set-variable variableName="stepId" value="#[vars.msgPayload.stepId]" />
-        <set-variable variableName="dedupKey" value="#[vars.stepId ++ '_RELEASE']" />
+        <ee:transform doc:name="Init Compensation Context">
+            <ee:variables>
+                <ee:set-variable variableName="compTx"><![CDATA[%dw 2.0
+output application/json
+var msg = if (payload is Binary or payload is String) read(payload, 'application/json') else payload
+var sId = msg.stepId default ""
+---
+{
+    ackId: attributes.ackId,
+    resId: msg.reservationId,
+    stepId: sId,
+    dedupKey: sId ++ "_RELEASE"
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
 
         <try doc:name="Atomic Try Scope" transactionalAction="ALWAYS_BEGIN">
-            <!-- Mark Reservation RELEASED in inventory_db -->
             <db:update config-ref="Inventory_DB_Config" doc:name="Set Reservation RELEASED">
                 <db:sql><![CDATA[
                     UPDATE inventory_reservations 
                     SET status = 'RELEASED', released_at = CURRENT_TIMESTAMP 
                     WHERE reservation_id = :resId
                 ]]></db:sql>
-                <db:input-parameters><![CDATA[#[{'resId': vars.resId}]]]></db:input-parameters>
+                <db:input-parameters><![CDATA[#[{'resId': vars.compTx.resId}]]]></db:input-parameters>
             </db:update>
 
             <db:insert config-ref="Inventory_DB_Config" doc:name="Record Dedup">
@@ -178,12 +192,12 @@
                     VALUES (:dedupKey, :stepId, 'COMPENSATE_RELEASE', '{"status":"RELEASED"}', CURRENT_TIMESTAMP)
                 ]]></db:sql>
                 <db:input-parameters><![CDATA[#[{
-                    'dedupKey': vars.dedupKey,
-                    'stepId': vars.stepId
+                    'dedupKey': vars.compTx.dedupKey,
+                    'stepId': vars.compTx.stepId
                 }]]]></db:input-parameters>
             </db:insert>
         </try>
 
-        <amqp:ack ackId="#[vars.ackId]" doc:name="Ack Release Message" />
+        <amqp:ack ackId="#[vars.compTx.ackId]" doc:name="Ack Release Message" />
     </flow>
 </mule>

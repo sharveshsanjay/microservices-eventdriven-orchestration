@@ -38,8 +38,20 @@
         <!-- Intercept CORS Preflight before APIKit -->
         <choice doc:name="Check for Preflight OPTIONS">
             <when expression="#[attributes.method == 'OPTIONS']">
-                <set-variable variableName="httpStatus" value="200" doc:name="Set 200 OK"/>
-                <set-payload value="#['']" doc:name="Empty Payload"/>
+                <ee:transform doc:name="Preflight 200 OK">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+""]]></ee:set-payload>
+                    </ee:message>
+                    <ee:variables>
+                        <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/json
+---
+200]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
             </when>
             <otherwise>
                 <apikit:router config-ref="order-experience-api-config" />
@@ -49,54 +61,118 @@
 
     <!-- POST /orders -->
     <flow name="post:\orders:application\json:order-experience-api-config">
-        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
-        <set-variable variableName="inboundOrder" value="#[payload]"/>
-
-        <http:request method="POST" 
-                      config-ref="HTTP_Request_configuration" 
-                      path="/api/v1/sagas/order-fulfilment" 
-                      doc:name="Invoke Process API">
-            <http:body>#[vars.inboundOrder]</http:body>
-            <http:headers>#[{
-                'x-correlation-id': vars.correlationId,
-                'Content-Type': 'application/json'
-            }]</http:headers>
-        </http:request>
-
-        <ee:transform doc:name="Build Experience Response">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-                output application/json
-                ---
-                {
-                    orderId: payload.orderId,
-                    sagaId: payload.sagaId,
-                    orderStatus: "PROCESSING",
-                    statusUrl: "/orders/" ++ payload.orderId ++ "/status",
-                    correlationId: vars.correlationId
-                }]]></ee:set-payload>
-            </ee:message>
+        <!-- Initialize Transaction Context & Validate Attributes -->
+        <ee:transform doc:name="Validate and Initialize Context">
+            <ee:variables>
+                <ee:set-variable variableName="tx"><![CDATA[%dw 2.0
+output application/json
+---
+{
+    correlationId: attributes.headers['x-correlation-id'] default correlationId default uuid(),
+    inboundOrder: payload
+}]]></ee:set-variable>
+                <ee:set-variable variableName="validationErrors"><![CDATA[%dw 2.0
+output application/json
+var p = payload default {}
+var errors = [
+    if (isEmpty(p.orderId)) "orderId is required and cannot be empty" else null,
+    if (isEmpty(p.customerId)) "customerId is required and cannot be empty" else null,
+    if (isEmpty(p.currency)) "currency is required (e.g., 'INR')" else null,
+    if (isEmpty(p.totalAmount) or (p.totalAmount as Number default 0) <= 0) "totalAmount must be a positive number greater than 0" else null,
+    if (isEmpty(p.items) or sizeOf(p.items default []) == 0) "items must contain at least one order line item" else null,
+    if (!isEmpty(p.items) and (p.items some (item) -> isEmpty(item.sku) or (item.quantity as Number default 0) <= 0 or (item.unitPrice as Number default 0) < 0)) "each item in items must include sku, quantity > 0, and unitPrice >= 0" else null,
+    if (isEmpty(p.payment)) "payment object is required" else null,
+    if (!isEmpty(p.payment) and (isEmpty(p.payment.method) or isEmpty(p.payment.cardToken))) "payment must contain 'method' and 'cardToken'" else null,
+    if (isEmpty(p.shipping)) "shipping object is required" else null,
+    if (!isEmpty(p.shipping) and (isEmpty(p.shipping.addressLine1) or isEmpty(p.shipping.city) or isEmpty(p.shipping.state) or isEmpty(p.shipping.postalCode) or isEmpty(p.shipping.country) or isEmpty(p.shipping.serviceLevel))) "shipping must include addressLine1, city, state, postalCode, country, and serviceLevel" else null
+] filter ($ != null)
+---
+errors]]></ee:set-variable>
+            </ee:variables>
         </ee:transform>
-        <set-variable variableName="httpStatus" value="202"/>
+
+        <!-- Conditional Routing -->
+        <choice doc:name="Check Validation Results">
+            <!-- Invalid: Format 400 Bad Request -->
+            <when expression="#[!isEmpty(vars.validationErrors)]">
+                <ee:transform doc:name="Format 400 Bad Request">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    errorCode: "INVALID_REQUEST_PAYLOAD",
+    errorMessage: "Order payload failed attribute validation",
+    validationErrors: vars.validationErrors,
+    correlationId: vars.tx.correlationId,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+                    </ee:message>
+                    <ee:variables>
+                        <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/json
+---
+400]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+            </when>
+
+            <!-- Valid: Invoke Process API & Return 202 Accepted -->
+            <otherwise>
+                <http:request method="POST" 
+                              config-ref="HTTP_Request_configuration" 
+                              path="/api/v1/sagas/order-fulfilment" 
+                              doc:name="Invoke Process API">
+                    <http:body>#[vars.tx.inboundOrder]</http:body>
+                    <http:headers>#[{
+                        'x-correlation-id': vars.tx.correlationId,
+                        'Content-Type': 'application/json'
+                    }]</http:headers>
+                </http:request>
+
+                <ee:transform doc:name="Build 202 Accepted Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    orderId: payload.orderId,
+    sagaId: payload.sagaId,
+    orderStatus: "PROCESSING",
+    statusUrl: "/orders/" ++ payload.orderId ++ "/status",
+    correlationId: vars.tx.correlationId
+}]]></ee:set-payload>
+                    </ee:message>
+                    <ee:variables>
+                        <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/json
+---
+202]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+            </otherwise>
+        </choice>
     </flow>
 
     <!-- GET /orders/{orderId}/status -->
     <flow name="get:\orders\(orderId)\status:order-experience-api-config">
-        <set-variable variableName="orderId" value="#[attributes.uriParams.orderId]"/>
-        <set-variable variableName="correlationId" value="#[attributes.headers['x-correlation-id'] default correlationId default uuid()]"/>
-
-        <ee:transform doc:name="Return Status">
+        <ee:transform doc:name="Return 200 Status">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
-                output application/json
-                ---
-                {
-                    orderId: vars.orderId,
-                    status: "IN_PROGRESS",
-                    updatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
-                }]]></ee:set-payload>
+output application/json
+---
+{
+    orderId: attributes.uriParams.orderId,
+    status: "IN_PROGRESS",
+    updatedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
             </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/json
+---
+200]]></ee:set-variable>
+            </ee:variables>
         </ee:transform>
-        <set-variable variableName="httpStatus" value="200"/>
     </flow>
 </mule>
